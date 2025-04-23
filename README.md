@@ -36,6 +36,7 @@ This Space is automatically updated every Sunday at midnight UTC with the latest
 - Trained on carefully curated Wikipedia articles
 - Optimized for educational content and basic concepts
 - Uses SQLite database for tracking training data and model performance
+- Supports machine unlearning experiments (see [MACHINE_UNLEARNING.md](MACHINE_UNLEARNING.md))
 
 ## Database Migration
 The training data tracking system has been migrated from JSON files to SQLite:
@@ -55,3 +56,22 @@ The training data tracking system has been migrated from JSON files to SQLite:
    - The ChangelogDB class provides a high-level interface similar to the original JSON-based logger
    - For direct database access, use the functions in `db_utils.py`
    - Run `python test_db.py` to verify the database functionality
+
+## Machine Unlearning Support
+
+This project now supports machine unlearning experiments, which allow the model to "forget" specific information it has learned during training.
+
+1. **Token Impact Tracking**
+   - The system tracks which tokens have the most impact on the model's predictions
+   - This information is stored in the database as "token impact data"
+   - Token impact data is essential for targeted machine unlearning
+
+2. **Preparing for Machine Unlearning**
+   - Run `python scripts/prepare_for_machine_unlearning.py` to prepare the database
+   - This script fixes the database schema and validates token impact data
+   - See [MACHINE_UNLEARNING.md](MACHINE_UNLEARNING.md) for detailed information
+
+3. **Next Steps**
+   - Implement machine unlearning algorithms that use the token impact data
+   - Create evaluation metrics to measure the effectiveness of unlearning
+   - Compare different unlearning approaches

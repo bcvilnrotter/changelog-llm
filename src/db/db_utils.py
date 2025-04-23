@@ -415,37 +415,77 @@ def mark_used_in_training(page_ids: List[str], model_checkpoint: str,
                     metadata_id
                 ))
             
-            # Handle token impact data
+            # Handle token impact data with improved error handling and logging
             token_impact = page_metrics.get('token_impact')
             if token_impact and isinstance(token_impact, dict):
-                # Create token impact record
-                cursor.execute('''
-                    INSERT INTO token_impacts (metadata_id, total_tokens)
-                    VALUES (?, ?)
-                ''', (metadata_id, token_impact.get('total_tokens', 0)))
-                
-                token_impact_id = cursor.lastrowid
-                
-                # Add top tokens
-                top_tokens = token_impact.get('top_tokens', [])
-                for token in top_tokens:
-                    position = token['position']
-                    context_start = token.get('context', [position, position])[0]
-                    context_end = token.get('context', [position, position])[1]
+                try:
+                    # Log token impact data for debugging
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(f"Processing token impact data for page_id={page_id}")
+                    print(f"DEBUG: Processing token impact data for page_id={page_id}")
+                    print(f"DEBUG: metadata_id={metadata_id}, total_tokens={token_impact.get('total_tokens', 0)}")
                     
+                    # Create token impact record in token_impacts table (plural)
                     cursor.execute('''
-                        INSERT INTO top_tokens (
-                            token_impact_id, token_id, position, impact,
-                            context_start, context_end
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (
-                        token_impact_id,
-                        token['token_id'],
-                        position,
-                        float(token['impact']),
-                        context_start,
-                        context_end
-                    ))
+                        INSERT INTO token_impacts (metadata_id, total_tokens)
+                        VALUES (?, ?)
+                    ''', (metadata_id, token_impact.get('total_tokens', 0)))
+                    
+                    token_impact_id = cursor.lastrowid
+                    if token_impact_id is None:
+                        logger.error(f"Failed to get lastrowid for token_impacts insert")
+                        print(f"ERROR: Failed to get lastrowid for token_impacts insert")
+                        continue
+                    
+                    logger.info(f"Created token_impacts record with id={token_impact_id}")
+                    print(f"DEBUG: Created token_impacts record with id={token_impact_id}")
+                    
+                    # Add top tokens
+                    top_tokens = token_impact.get('top_tokens', [])
+                    logger.info(f"Found {len(top_tokens)} top tokens to process")
+                    print(f"DEBUG: Found {len(top_tokens)} top tokens to process")
+                    
+                    for token in top_tokens:
+                        try:
+                            position = token['position']
+                            # Handle context data safely
+                            context = token.get('context', [position, position])
+                            if not isinstance(context, list) or len(context) < 2:
+                                context = [position, position]
+                            
+                            context_start = context[0]
+                            context_end = context[1]
+                            
+                            # Ensure token_id is an integer
+                            token_id = int(token['token_id'])
+                            
+                            # Insert into top_tokens table
+                            cursor.execute('''
+                                INSERT INTO top_tokens (
+                                    token_impact_id, token_id, position, impact,
+                                    context_start, context_end
+                                ) VALUES (?, ?, ?, ?, ?, ?)
+                            ''', (
+                                token_impact_id,
+                                token_id,
+                                position,
+                                float(token['impact']),
+                                context_start,
+                                context_end
+                            ))
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing top token: {str(e)}")
+                            logger.error(f"Token data: {token}")
+                            # Continue with next token
+                            continue
+                
+                except Exception as e:
+                    logger.error(f"Error processing token impact data: {str(e)}")
+                    logger.error(f"Token impact data: {token_impact}")
+                    # Continue with next page
+                    continue
     
     conn.commit()
     conn.close()

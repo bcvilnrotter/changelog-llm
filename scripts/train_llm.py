@@ -568,17 +568,22 @@ class LLMTrainer:
                 avg_loss = sum(metrics["average_loss"]) / len(metrics["average_loss"])
                 rel_loss = (metrics["initial_loss"] - avg_loss) / metrics["initial_loss"]
                 
-                # For token impact, use the last epoch's values
+                # For token impact, use the last epoch's values and format correctly for db_utils.mark_used_in_training
                 token_impact = None
                 if metrics["token_impact"] and len(metrics["token_impact"]) > 0:
                     # Get the last epoch's token impact data
                     last_impact = metrics["token_impact"][-1]
-                    # Ensure we're passing the token impact data directly
+                    
+                    # Format token impact data correctly for machine unlearning experiments
+                    # The db_utils.mark_used_in_training function expects "top_tokens" instead of "critical_tokens"
                     token_impact = {
-                        "critical_tokens": last_impact["critical_tokens"],
-                        "impact_threshold": last_impact["impact_threshold"],
+                        "top_tokens": last_impact["critical_tokens"],  # Rename critical_tokens to top_tokens
                         "total_tokens": last_impact["total_tokens"]
                     }
+                    
+                    # Always log the token impact data for debugging
+                    logger.info(f"Token impact data for {page_id}: {token_impact}")
+                    print(f"Token impact data for {page_id}: top_tokens={len(token_impact['top_tokens'])}, total_tokens={token_impact['total_tokens']}")
                 
                 # Only include metrics if we have valid values
                 metrics_dict = {
