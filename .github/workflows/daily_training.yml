@@ -38,7 +38,7 @@ jobs:
     - name: Prepare training titles
       run: |
         # Extract titles for training (prioritizing unused pages)
-        python scripts/extract_training_titles.py --count 10000 --debug
+        python scripts/extract_training_titles.py --count 5000 --debug
         
         # Log how many titles we got
         TITLE_COUNT=$(python -c "import json; print(len(json.load(open('titles.json'))))")
