@@ -65,6 +65,15 @@ jobs:
           --learning-rate 1e-4 \
           --min-pages 1
 
+    - name: Limit to top 10 nodes
+      run: |
+        # Mark only the top 10 nodes as used in training
+        python scripts/mark_top_nodes.py --top-n 10
+        
+        # Verify the changes
+        echo "Database after limiting to top 10 nodes:"
+        python check_db.py
+
     - name: Clean up and push changes
       run: |
         # Ensure we're on the latest commit
@@ -79,7 +88,7 @@ jobs:
         git commit -m "Daily training: $(date +'%Y-%m-%d')
     
         - Trained on new pages
-        - Updated changelog
+        - Updated changelog (limited to top 10 nodes)
         - Saved new model checkpoint"
     
         # Push the changes
