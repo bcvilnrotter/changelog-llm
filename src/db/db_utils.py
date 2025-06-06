@@ -5,11 +5,15 @@ This module provides common database operations for the training process.
 
 import json
 import datetime
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 import sqlite3
 
 from src.db.db_schema import get_db_connection, init_db
+from src.db.shard_manager import get_shard_manager
+
+logger = logging.getLogger(__name__)
 
 def create_training_run(model_name: str, base_model: str, hyperparameters: Dict, git_commit: Optional[str] = None) -> int:
     """
@@ -288,7 +292,12 @@ def log_page(title: str, page_id: str, revision_id: str, content_hash: str, acti
     if action not in ["added", "updated", "removed"]:
         raise ValueError("Action must be one of: added, updated, removed")
     
-    conn = get_db_connection()
+    # Get the shard manager
+    shard_manager = get_shard_manager()
+    
+    # For writing, use the current shard
+    db_path = shard_manager.get_shard_for_writing()
+    conn = get_db_connection(db_path, for_writing=True)
     cursor = conn.cursor()
     
     timestamp = datetime.datetime.utcnow().isoformat() + "Z"
@@ -316,6 +325,10 @@ def log_page(title: str, page_id: str, revision_id: str, content_hash: str, acti
         ''', (entry_id,))
         
         conn.commit()
+        
+        # Update the shard index
+        shard_manager.shard_index.add_page(page_id, db_path)
+        
         return entry_id
     
     except sqlite3.IntegrityError:
@@ -500,24 +513,33 @@ def get_page_by_id(page_id: str) -> Optional[Dict]:
     Returns:
         Dict or None: The page entry if found
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # Get the shard manager
+    shard_manager = get_shard_manager()
     
-    cursor.execute('''
-        SELECT e.*, tm.used_in_training, tm.training_timestamp, 
-               tm.model_checkpoint, tm.average_loss, tm.relative_loss
-        FROM entries e
-        LEFT JOIN training_metadata tm ON e.id = tm.entry_id
-        WHERE e.page_id = ?
-    ''', (page_id,))
+    # Get the shard(s) that might contain this page
+    shard_paths = shard_manager.get_shard_for_reading(page_id)
     
-    row = cursor.fetchone()
-    conn.close()
+    for shard_path in shard_paths:
+        conn = get_db_connection(shard_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT e.*, tm.used_in_training, tm.training_timestamp, 
+                   tm.model_checkpoint, tm.average_loss, tm.relative_loss
+            FROM entries e
+            LEFT JOIN training_metadata tm ON e.id = tm.entry_id
+            WHERE e.page_id = ?
+        ''', (page_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            # Update the shard index if we found the page
+            shard_manager.shard_index.add_page(page_id, shard_path)
+            return dict(row)
     
-    if not row:
-        return None
-    
-    return dict(row)
+    return None
 
 def get_page_history(page_id: str) -> List[Dict]:
     """
@@ -530,36 +552,52 @@ def get_page_history(page_id: str) -> List[Dict]:
         List[Dict]: List of page entries
     """
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Get the shard manager
+        shard_manager = get_shard_manager()
         
-        try:
-            cursor.execute('''
-                SELECT e.*, tm.used_in_training, tm.training_timestamp, 
-                       tm.model_checkpoint, tm.average_loss, tm.relative_loss
-                FROM entries e
-                LEFT JOIN training_metadata tm ON e.id = tm.entry_id
-                WHERE e.page_id = ?
-                ORDER BY e.timestamp DESC
-            ''', (page_id,))
-            
-            entries = []
-            for row in cursor.fetchall():
+        # Get the shard(s) that might contain this page
+        shard_paths = shard_manager.get_shard_for_reading(page_id)
+        
+        entries = []
+        for shard_path in shard_paths:
+            try:
+                conn = get_db_connection(shard_path)
+                cursor = conn.cursor()
+                
                 try:
-                    entries.append(dict(row))
+                    cursor.execute('''
+                        SELECT e.*, tm.used_in_training, tm.training_timestamp, 
+                               tm.model_checkpoint, tm.average_loss, tm.relative_loss
+                        FROM entries e
+                        LEFT JOIN training_metadata tm ON e.id = tm.entry_id
+                        WHERE e.page_id = ?
+                        ORDER BY e.timestamp DESC
+                    ''', (page_id,))
+                    
+                    for row in cursor.fetchall():
+                        try:
+                            entries.append(dict(row))
+                            # Update the shard index if we found the page
+                            shard_manager.shard_index.add_page(page_id, shard_path)
+                        except Exception as e:
+                            logger.error(f"Error converting row to dict: {str(e)}")
+                            # Skip this row and continue
+                            continue
                 except Exception as e:
-                    print(f"Error converting row to dict: {str(e)}")
-                    # Skip this row and continue
-                    continue
-        except Exception as e:
-            print(f"Error querying database: {str(e)}")
-            return []
-        finally:
-            conn.close()
+                    logger.error(f"Error querying database: {str(e)}")
+                finally:
+                    conn.close()
+                
+                # If we found entries, we can stop searching
+                if entries:
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error processing shard {shard_path}: {str(e)}")
         
         return entries
     except Exception as e:
-        print(f"Unexpected error in get_page_history: {str(e)}")
+        logger.error(f"Unexpected error in get_page_history: {str(e)}")
         return []
 
 def check_updates(page_id: str, revision_id: str) -> bool:
@@ -573,59 +611,71 @@ def check_updates(page_id: str, revision_id: str) -> bool:
     Returns:
         bool: True if page needs updating, False otherwise
     """
-    import logging
-    logger = logging.getLogger(__name__)
-    
     try:
         logger.info(f"Checking updates for page_id={page_id}, revision_id={revision_id}")
         
-        # First check if the page exists at all
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Get the shard manager
+        shard_manager = get_shard_manager()
         
-        try:
-            # Use a simple count query first to check existence
-            cursor.execute('SELECT COUNT(*) FROM entries WHERE page_id = ?', (page_id,))
-            count = cursor.fetchone()[0]
-            
-            if count == 0:
-                logger.info(f"No existing entry found for page_id={page_id}, needs adding")
+        # Get the shard(s) that might contain this page
+        shard_paths = shard_manager.get_shard_for_reading(page_id)
+        
+        for shard_path in shard_paths:
+            try:
+                # First check if the page exists at all
+                conn = get_db_connection(shard_path)
+                cursor = conn.cursor()
+                
+                # Use a simple count query first to check existence
+                cursor.execute('SELECT COUNT(*) FROM entries WHERE page_id = ?', (page_id,))
+                count = cursor.fetchone()[0]
+                
+                if count == 0:
+                    # Page doesn't exist in this shard, try the next one
+                    conn.close()
+                    continue
+                
+                # If we get here, the page exists in this shard, so get its revision_id
+                cursor.execute('''
+                    SELECT revision_id 
+                    FROM entries 
+                    WHERE page_id = ? 
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                ''', (page_id,))
+                
+                result = cursor.fetchone()
+                logger.info(f"Found existing entry with page_id={page_id} in shard {shard_path}")
+                
+                if not result:
+                    logger.warning(f"Strange: count was {count} but no result found")
+                    conn.close()
+                    return True
+                
+                # Get the revision_id as bytes and decode it safely
+                db_revision_id_bytes = result[0]
+                if isinstance(db_revision_id_bytes, bytes):
+                    db_revision_id = db_revision_id_bytes.decode('utf-8', errors='replace')
+                else:
+                    db_revision_id = str(db_revision_id_bytes)
+                
+                logger.info(f"Comparing revision IDs: {db_revision_id} vs {revision_id}")
+                
+                # Update the shard index since we found the page
+                shard_manager.shard_index.add_page(page_id, shard_path)
+                
                 conn.close()
-                return True  # No existing entry, needs adding
-            
-            # If we get here, the page exists, so get its revision_id
-            cursor.execute('''
-                SELECT revision_id 
-                FROM entries 
-                WHERE page_id = ? 
-                ORDER BY timestamp DESC
-                LIMIT 1
-            ''', (page_id,))
-            
-            result = cursor.fetchone()
-            logger.info(f"Found existing entry with page_id={page_id}")
-            
-            if not result:
-                logger.warning(f"Strange: count was {count} but no result found")
-                return True
-            
-            # Get the revision_id as bytes and decode it safely
-            db_revision_id_bytes = result[0]
-            if isinstance(db_revision_id_bytes, bytes):
-                db_revision_id = db_revision_id_bytes.decode('utf-8', errors='replace')
-            else:
-                db_revision_id = str(db_revision_id_bytes)
-            
-            logger.info(f"Comparing revision IDs: {db_revision_id} vs {revision_id}")
-            return db_revision_id != revision_id
-            
-        except Exception as e:
-            logger.error(f"Error querying database: {str(e)}")
-            logger.error(f"Exception type: {type(e).__name__}")
-            # If there's an error, assume we need to add the page
-            return True
-        finally:
-            conn.close()
+                return db_revision_id != revision_id
+                
+            except Exception as e:
+                logger.error(f"Error querying shard {shard_path}: {str(e)}")
+                logger.error(f"Exception type: {type(e).__name__}")
+                # Continue to the next shard
+                continue
+        
+        # If we get here, the page wasn't found in any shard
+        logger.info(f"No existing entry found for page_id={page_id}, needs adding")
+        return True  # No existing entry, needs adding
             
     except Exception as e:
         logger.error(f"Unexpected error in check_updates: {str(e)}")
@@ -640,18 +690,40 @@ def get_unused_pages() -> List[Dict]:
     Returns:
         List[Dict]: List of page entries that haven't been used in training
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # Get the shard manager
+    shard_manager = get_shard_manager()
     
-    cursor.execute('''
-        SELECT e.*
-        FROM entries e
-        JOIN training_metadata tm ON e.id = tm.entry_id
-        WHERE tm.used_in_training = 0
-    ''')
+    # Get all shards
+    shard_paths = shard_manager.get_all_shards()
     
-    entries = [dict(row) for row in cursor.fetchall()]
-    conn.close()
+    entries = []
+    for shard_path in shard_paths:
+        try:
+            conn = get_db_connection(shard_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT e.*
+                FROM entries e
+                JOIN training_metadata tm ON e.id = tm.entry_id
+                WHERE tm.used_in_training = 0
+            ''')
+            
+            for row in cursor.fetchall():
+                entry = dict(row)
+                entries.append(entry)
+                
+                # Update the shard index
+                page_id = entry.get('page_id')
+                if page_id:
+                    shard_manager.shard_index.add_page(page_id, shard_path)
+            
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Error querying shard {shard_path}: {str(e)}")
+            # Continue to the next shard
+            continue
     
     return entries
 
@@ -665,20 +737,46 @@ def get_page_revisions(page_id: str) -> List[Dict]:
     Returns:
         List[Dict]: List of revision entries for the page, sorted by revision_number
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # Get the shard manager
+    shard_manager = get_shard_manager()
     
-    cursor.execute('''
-        SELECT e.*, tm.used_in_training, tm.training_timestamp, 
-               tm.model_checkpoint, tm.average_loss, tm.relative_loss
-        FROM entries e
-        LEFT JOIN training_metadata tm ON e.id = tm.entry_id
-        WHERE e.is_revision = 1 AND e.parent_id = ?
-        ORDER BY e.revision_number
-    ''', (page_id,))
+    # Get the shard(s) that might contain this page
+    shard_paths = shard_manager.get_shard_for_reading(page_id)
     
-    revisions = [dict(row) for row in cursor.fetchall()]
-    conn.close()
+    revisions = []
+    for shard_path in shard_paths:
+        try:
+            conn = get_db_connection(shard_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT e.*, tm.used_in_training, tm.training_timestamp, 
+                       tm.model_checkpoint, tm.average_loss, tm.relative_loss
+                FROM entries e
+                LEFT JOIN training_metadata tm ON e.id = tm.entry_id
+                WHERE e.is_revision = 1 AND e.parent_id = ?
+                ORDER BY e.revision_number
+            ''', (page_id,))
+            
+            for row in cursor.fetchall():
+                revision = dict(row)
+                revisions.append(revision)
+                
+                # Update the shard index
+                revision_page_id = revision.get('page_id')
+                if revision_page_id:
+                    shard_manager.shard_index.add_page(revision_page_id, shard_path)
+            
+            conn.close()
+            
+            # If we found revisions, we can stop searching
+            if revisions:
+                break
+                
+        except Exception as e:
+            logger.error(f"Error querying shard {shard_path}: {str(e)}")
+            # Continue to the next shard
+            continue
     
     return revisions
 
@@ -689,49 +787,60 @@ def get_main_pages() -> List[Dict]:
     Returns:
         List[Dict]: List of main page entries (excluding revisions)
     """
-    import logging
-    logger = logging.getLogger(__name__)
+    # Get the shard manager
+    shard_manager = get_shard_manager()
     
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Use a simpler query without the problematic columns
-        query = '''
-            SELECT e.*, tm.used_in_training
-            FROM entries e
-            LEFT JOIN training_metadata tm ON e.id = tm.entry_id
-            WHERE e.is_revision = 0
-        '''
-        
-        logger.info(f"Executing query: {query}")
-        cursor.execute(query)
-        
-        pages = []
-        for row in cursor.fetchall():
-            page = dict(row)
-            # If training_metadata values are NULL or missing, set defaults
-            if page.get("used_in_training") is None:
-                page["used_in_training"] = 0
+    # Get all shards
+    shard_paths = shard_manager.get_all_shards()
+    
+    pages = []
+    for shard_path in shard_paths:
+        try:
+            conn = get_db_connection(shard_path)
+            cursor = conn.cursor()
             
-            # Add missing columns with default values
-            if "training_timestamp" not in page:
-                page["training_timestamp"] = None
-            if "model_checkpoint" not in page:
-                page["model_checkpoint"] = None
-            if "average_loss" not in page:
-                page["average_loss"] = None
-            if "relative_loss" not in page:
-                page["relative_loss"] = None
-            pages.append(page)
-        conn.close()
-        
-        return pages
-    except Exception as e:
-        logger.error(f"Error in get_main_pages: {str(e)}")
-        logger.error(f"Exception type: {type(e).__name__}")
-        # Return an empty list to avoid breaking the caller
-        return []
+            # Use a simpler query without the problematic columns
+            query = '''
+                SELECT e.*, tm.used_in_training
+                FROM entries e
+                LEFT JOIN training_metadata tm ON e.id = tm.entry_id
+                WHERE e.is_revision = 0
+            '''
+            
+            logger.info(f"Executing query on shard {shard_path}: {query}")
+            cursor.execute(query)
+            
+            for row in cursor.fetchall():
+                page = dict(row)
+                # If training_metadata values are NULL or missing, set defaults
+                if page.get("used_in_training") is None:
+                    page["used_in_training"] = 0
+                
+                # Add missing columns with default values
+                if "training_timestamp" not in page:
+                    page["training_timestamp"] = None
+                if "model_checkpoint" not in page:
+                    page["model_checkpoint"] = None
+                if "average_loss" not in page:
+                    page["average_loss"] = None
+                if "relative_loss" not in page:
+                    page["relative_loss"] = None
+                
+                pages.append(page)
+                
+                # Update the shard index
+                page_id = page.get('page_id')
+                if page_id:
+                    shard_manager.shard_index.add_page(page_id, shard_path)
+            
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Error querying shard {shard_path}: {str(e)}")
+            # Continue to the next shard
+            continue
+    
+    return pages
 
 def remove_unused_entries() -> int:
     """

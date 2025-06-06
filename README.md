@@ -38,8 +38,9 @@ This Space is automatically updated every Sunday at midnight UTC with the latest
 - Uses SQLite database for tracking training data and model performance
 - Supports machine unlearning experiments (see [MACHINE_UNLEARNING.md](MACHINE_UNLEARNING.md))
 
-## Database Migration
-The training data tracking system has been migrated from JSON files to SQLite:
+## Database System
+
+The training data tracking system uses SQLite with a sharded database approach to prevent database files from exceeding 100MB:
 
 1. **Why SQLite?**
    - Better performance for large datasets
@@ -47,13 +48,19 @@ The training data tracking system has been migrated from JSON files to SQLite:
    - Transaction support
    - Reduced memory footprint
 
-2. **Migration Process**
-   - Run `python migrate_to_sqlite.py` to convert existing JSON data to SQLite
-   - The original JSON format is preserved for backward compatibility
-   - All new data is stored in the SQLite database by default
+2. **Sharded Database Approach**
+   - Database is split into multiple smaller files (shards) when size approaches 90MB
+   - Each shard has the same schema as the original database
+   - A master index keeps track of which pages are in which shards
+   - See [SHARDED_DATABASE.md](SHARDED_DATABASE.md) for detailed information
 
-3. **Using the Database**
-   - The ChangelogDB class provides a high-level interface similar to the original JSON-based logger
+3. **Migration Process**
+   - Run `python scripts/migrate_to_sharded.py` to convert existing database to sharded approach
+   - Run `python migrate_to_sqlite.py` to convert JSON data to SQLite (legacy)
+   - All new data is stored in the sharded SQLite database by default
+
+4. **Using the Database**
+   - The ChangelogDB class provides a high-level interface that handles sharding automatically
    - For direct database access, use the functions in `db_utils.py`
    - Run `python test_db.py` to verify the database functionality
 

@@ -68,11 +68,11 @@ jobs:
     - name: Limit to top 10 nodes
       run: |
         # Mark only the top 10 nodes as used in training
-        python scripts/mark_top_nodes.py --top-n 10
+        python scripts/mark_top_nodes_sharded.py --top-n 10
         
         # Verify the changes
         echo "Database after limiting to top 10 nodes:"
-        python check_db.py
+        python check_db_sharded.py
 
     - name: Clean up and push changes
       run: |
@@ -81,14 +81,15 @@ jobs:
         git pull origin main
     
         # Stage changelog and model files
-        git add data/changelog.db
+        git add data/changelog_*.db
+        git add data/shard_index.json
         git add models/
     
         # Create commit with training details
         git commit -m "Daily training: $(date +'%Y-%m-%d')
     
         - Trained on new pages
-        - Updated changelog (limited to top 10 nodes)
+        - Updated changelog shards (limited to top 10 nodes)
         - Saved new model checkpoint"
     
         # Push the changes

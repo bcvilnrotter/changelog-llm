@@ -10,12 +10,13 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-def get_db_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+def get_db_connection(db_path: Optional[str] = None, for_writing: bool = False) -> sqlite3.Connection:
     """
     Create and return a connection to the SQLite database.
     
     Args:
         db_path (str, optional): Path to the database file
+        for_writing (bool, optional): Whether the connection is for writing
         
     Returns:
         sqlite3.Connection: A connection to the SQLite database
@@ -25,9 +26,31 @@ def get_db_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     
     try:
         if db_path is None:
-            # Default to a database file next to this module
-            parent_dir = Path(__file__).resolve().parent.parent.parent
-            db_path = os.path.join(parent_dir, "data", "changelog.db")
+            # If no specific path is provided, use the shard manager
+            try:
+                from src.db.shard_manager import get_shard_manager
+                shard_manager = get_shard_manager()
+                
+                if for_writing:
+                    # For writing, use the current shard
+                    db_path = shard_manager.get_shard_for_writing()
+                    logger.info(f"Using current shard for writing: {db_path}")
+                else:
+                    # For reading without a specific page_id, use the most recent shard
+                    # This is a simplification - in practice, you might need to query multiple shards
+                    shards = shard_manager.get_all_shards()
+                    if shards:
+                        db_path = shards[0]  # Use the first shard (most recent)
+                        logger.info(f"Using most recent shard for reading: {db_path}")
+                    else:
+                        # No shards exist yet, create one
+                        db_path = shard_manager.create_new_shard()
+                        logger.info(f"No shards exist, created new shard: {db_path}")
+            except ImportError:
+                # Shard manager not available, fall back to default behavior
+                parent_dir = Path(__file__).resolve().parent.parent.parent
+                db_path = os.path.join(parent_dir, "data", "changelog.db")
+                logger.info(f"Shard manager not available, using default database: {db_path}")
         
         logger.info(f"Opening database connection to: {db_path}")
         
@@ -45,7 +68,7 @@ def get_db_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
         # Use bytes as text factory to avoid encoding issues
         conn.text_factory = bytes
         
-        logger.info("Database connection established successfully")
+        logger.debug("Database connection established successfully")
         return conn
     except Exception as e:
         logger.error(f"Error connecting to database: {str(e)}")

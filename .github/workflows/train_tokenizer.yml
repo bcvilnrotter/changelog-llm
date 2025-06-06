@@ -29,13 +29,55 @@ jobs:
         
     - name: Check database
       run: |
-        # Check if the database file exists
-        if [ -f "data/changelog.db" ]; then
-          echo "Database file exists"
+        # Install sqlite3 command-line tool
+        sudo apt-get update
+        sudo apt-get install -y sqlite3
+        
+        # Check if any database shards exist
+        SHARDS=$(find data -name "changelog_*.db" | wc -l)
+        
+        if [ "$SHARDS" -gt 0 ]; then
+          echo "Found $SHARDS database shards"
           
-          # Install sqlite3 command-line tool
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
+          # List all shards
+          echo "Database shards:"
+          find data -name "changelog_*.db" -exec ls -lh {} \;
+          
+          # Check database schema (using the first shard)
+          FIRST_SHARD=$(find data -name "changelog_*.db" | head -n 1)
+          echo "Database schema (from $FIRST_SHARD):"
+          sqlite3 "$FIRST_SHARD" ".schema"
+          
+          # Count entries in all shards
+          echo "Number of entries in all shards:"
+          TOTAL=0
+          for SHARD in $(find data -name "changelog_*.db"); do
+            COUNT=$(sqlite3 "$SHARD" "SELECT COUNT(*) FROM entries;")
+            echo "  $SHARD: $COUNT entries"
+            TOTAL=$((TOTAL + COUNT))
+          done
+          echo "Total entries across all shards: $TOTAL"
+          
+          # Check if there are any main pages
+          echo "Number of main pages in all shards:"
+          MAIN_TOTAL=0
+          for SHARD in $(find data -name "changelog_*.db"); do
+            COUNT=$(sqlite3 "$SHARD" "SELECT COUNT(*) FROM entries WHERE is_revision = 0;")
+            echo "  $SHARD: $COUNT main pages"
+            MAIN_TOTAL=$((MAIN_TOTAL + COUNT))
+          done
+          echo "Total main pages across all shards: $MAIN_TOTAL"
+          
+          # Check shard index
+          if [ -f "data/shard_index.json" ]; then
+            echo "Shard index exists"
+            echo "Shard index size: $(du -h data/shard_index.json | cut -f1)"
+            echo "Number of entries in shard index: $(grep -o "\"page_id\"" data/shard_index.json | wc -l)"
+          else
+            echo "Shard index does not exist"
+          fi
+        elif [ -f "data/changelog.db" ]; then
+          echo "Legacy database file exists (not sharded)"
           
           # Check database schema
           echo "Database schema:"
@@ -48,8 +90,10 @@ jobs:
           # Check if there are any main pages
           echo "Number of main pages in the database:"
           sqlite3 data/changelog.db "SELECT COUNT(*) FROM entries WHERE is_revision = 0;"
+          
+          echo "WARNING: Database is not sharded. Consider migrating to sharded database."
         else
-          echo "Database file does not exist"
+          echo "No database files exist"
         fi
 
     - name: Configure Git

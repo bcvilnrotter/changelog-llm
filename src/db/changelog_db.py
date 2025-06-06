@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import datetime
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -16,6 +17,9 @@ from src.db.db_utils import (
     get_unused_pages, get_page_revisions, get_main_pages, remove_unused_entries,
     export_to_json as db_export_to_json
 )
+from src.db.shard_manager import get_shard_manager
+
+logger = logging.getLogger(__name__)
 
 class ChangelogDB:
     """
@@ -23,18 +27,36 @@ class ChangelogDB:
     This provides a higher-level interface for common changelog operations.
     """
     
-    def __init__(self, db_path: Optional[str] = None, debug: bool = False):
+    def __init__(self, db_path: Optional[str] = None, debug: bool = False, shard_size_limit_mb: int = 90):
         """
         Initialize the ChangelogDB.
         
         Args:
-            db_path (str, optional): Path to the database file
+            db_path (str, optional): Path to the database file or directory for shards
             debug (bool, optional): Enable debug logging
+            shard_size_limit_mb (int, optional): Maximum size of a shard in megabytes
         """
-        # Initialize the database if it doesn't exist
-        init_db(db_path)
-        self.db_path = db_path
         self.debug = debug
+        
+        # Determine the base path for shards
+        if db_path is None:
+            # Default to a database directory next to this module
+            parent_dir = Path(__file__).resolve().parent.parent.parent
+            self.base_path = os.path.join(parent_dir, "data")
+        else:
+            # If db_path is a file, use its directory as the base path
+            db_path_obj = Path(db_path)
+            if db_path_obj.is_file() or db_path_obj.suffix == '.db':
+                self.base_path = str(db_path_obj.parent)
+            else:
+                self.base_path = db_path
+        
+        # Initialize the shard manager
+        self.shard_manager = get_shard_manager(self.base_path, shard_size_limit_mb)
+        
+        if debug:
+            logger.info(f"Initialized ChangelogDB with base_path={self.base_path}")
+            logger.info(f"Using shard manager with size limit of {shard_size_limit_mb}MB")
     
     def _compute_hash(self, content: str) -> str:
         """
